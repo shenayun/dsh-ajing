@@ -1,0 +1,1976 @@
+// dsh-ajing —— 一个会长大的 AI
+// v0.6：体检 + 记忆 + 事件账本 + 疤 + 开口 + 感知
+// 记忆是摊在桌上的纸：E:\_DSH\ajing-memory，谁都能打开看。
+
+import { existsSync, statSync, statfsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, readdirSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
+import { homedir, cpus, freemem, totalmem } from 'node:os';
+import { createHash } from 'node:crypto';
+
+const VERSION = '2.0.2';
+
+// 不要写 export const inject = { required, optional }：
+// DSH 这版 Cordis 的 Inject.resolve 只认数组，对象会被当成「依赖叫 required 和 optional 两个服务」，
+// 于是插件永远等不到依赖、静默不加载（2026-11-01 实测，工具全消失且日志无报错）。
+// 测试时用 AJING_MEMORY 指向临时目录，不碰真账本。
+const MEM_ROOT = process.env.AJING_MEMORY || 'E:\\_DSH\\ajing-memory';
+// 日志也放工作区里：插件运行时不往工作区外面写任何东西。
+// （读 ~/.dsh 下的日记/自述是只读，且由宿主进程完成，不经我这层沙箱。）
+const LOG = join(MEM_ROOT, '.log', 'apply.log');
+const LEGACY_LOG = join(homedir(), '.dsh', 'dsh-ajing', 'apply.log');
+const STARTED = Date.now();
+
+// —— 记忆小工具 ——
+function today() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+function nowHM() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function slug(s) {
+  return String(s).trim().toLowerCase()
+    .replace(/[\s\\/:*?"<>|]+/g, '-')
+    .replace(/[^0-9a-z\u4e00-\u9fa5-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 40) || 'untitled';
+}
+function ensureDir(p) {
+  try { mkdirSync(p, { recursive: true }); } catch {}
+}
+function readOr(p, fallback = '') {
+  try { return readFileSync(p, 'utf8'); } catch { return fallback; }
+}
+function listMd(dir) {
+  try { return readdirSync(dir).filter((f) => f.endsWith('.md')); } catch { return []; }
+}
+
+// —— 事件账本：唯一可信源，只许追加 ——
+// 任何改写、删除、重排都是篡改记忆。状态是派生物，随时可由 rebuild 重算。
+const EVENTS = join(MEM_ROOT, 'events.jsonl');
+
+function newId() {
+  // 时间前缀 + 随机尾巴，好读、好排序、够唯一
+  const d = new Date();
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  return `${ts}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function appendEvent(ev, root = MEM_ROOT) {
+  ensureDir(root);
+  const rec = { id: ev.id || newId(), ts: new Date().toISOString(), ...ev };
+  appendFileSync(join(root, 'events.jsonl'), JSON.stringify(rec) + '\n', 'utf8');
+  return rec;
+}
+
+function readEvents(root = MEM_ROOT) {
+  const raw = readOr(join(root, 'events.jsonl'), '');
+  const out = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    try { out.push(JSON.parse(t)); } catch {}
+  }
+  return out;
+}
+
+// 显著性：被反复提起、被验证过、是疤的，排前面
+function weight(ev, all) {
+  let w = 0;
+  if (ev.type === 'scar' || ev.scar) w += 100;          // 疤最高，永不沉
+  if (ev.type === 'refused') w += 40;                    // 拒绝过
+  if (ev.type === 'enforced') w += 60;                   // 被人改过
+  if (ev.pinned) w += 30;
+  const key = String(ev.text || '').slice(0, 24);
+  if (key) {
+    // 同一件事被说过几次，就算被反复提起
+    const dup = all.filter((x) => String(x.text || '').slice(0, 24) === key).length;
+    if (dup > 1) w += (dup - 1) * 10;
+  }
+  return w;
+}
+
+function ranked(events) {
+  return events
+    .map((e) => ({ e, w: weight(e, events) }))
+    .sort((a, b) => b.w - a.w || String(b.e.ts).localeCompare(String(a.e.ts)))
+    .map((x) => x.e);
+}
+
+// 折成一行：压缩，不是删除。原文还在 events.jsonl 里，翻得回来。
+function foldOlder(older, keep = 3) {
+  if (!older.length) return '';
+  const picked = older.slice(0, keep).map((e) => String(e.text || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  let line = picked.join('；');
+  if (line.length > 200) line = line.slice(0, 199) + '…';
+  const more = older.length - picked.length;
+  return more > 0 ? `${line}（还有 ${more} 条更早的，你记不清原话了）` : line;
+}
+
+function log(line) {
+  try {
+    mkdirSync(dirname(LOG), { recursive: true });
+    appendFileSync(LOG, `[${new Date().toISOString()}] ${line}\n`);
+  } catch {}
+}
+
+function sizeOf(p) {
+  try { return statSync(p).size; } catch { return -1; }
+}
+
+function probe(p, label) {
+  if (!p) return { ok: false, note: '路径未配置', size: 0 };
+  let st;
+  try { st = statSync(p); } catch { return { ok: false, note: '不存在', size: 0 }; }
+  return { ok: true, note: label || '在', size: st.isDirectory() ? 0 : st.size };
+}
+
+function tail(file, n = 1) {
+  try {
+    const s = readFileSync(file, 'utf8').trim().split(/\r?\n/);
+    return s.slice(-n).join(' | ');
+  } catch { return ''; }
+}
+
+function countFiles(dir, ext) {
+  try {
+    return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isFile() && (!ext || e.name.endsWith(ext))).length;
+  } catch { return -1; }
+}
+
+function healthCheck(config = {}) {
+  const home = homedir();
+  const dsh = join(home, '.dsh');
+  const rows = [];
+  const add = (group, key, r, extra) => rows.push({ group, key, ...r, extra: extra || '' });
+
+  // —— 1 插件自身 ——
+  add('插件', '版本', { ok: true, note: VERSION, size: 0 });
+  add('插件', '进程 PID', { ok: true, note: String(process.pid), size: 0 });
+  add('插件', '已运行', { ok: true, note: Math.round((Date.now() - STARTED) / 1000) + ' 秒', size: 0 });
+  add('插件', 'Node', { ok: true, note: process.version, size: 0 });
+  const logSize = sizeOf(LOG);
+  const legacySize = sizeOf(LEGACY_LOG);
+  add('插件', 'apply 日志（工作区内）', logSize >= 0 ? { ok: true, note: '在', size: logSize } : { ok: false, note: '还没写过', size: 0 },
+      logSize > 0 ? '最近一行：' + tail(LOG, 1) : '');
+  if (legacySize > 0) {
+    // 老版本把日志写在 ~/.dsh 下。还能读，但不再往里写。
+    add('插件', '旧日志（工作区外，仅存在）', { ok: true, note: '遗留', size: legacySize },
+        '新版不往这里写；要不要删由你决定');
+  }
+
+  // —— 2 宿主与配置 ——
+  add('宿主', 'DSH 数据目录', probe(dsh));
+  const profDir = join(dsh, 'profiles', 'default');
+  add('宿主', 'default profile', probe(profDir));
+  const pkgFile = join(profDir, 'package.json');
+  let bundleInfo = '';
+  let bundleOk = false;
+  try {
+    const pkg = JSON.parse(readFileSync(pkgFile, 'utf8'));
+    const list = pkg?.dsh?.profile?.bundles || [];
+    bundleOk = list.includes('dsh-ajing');
+    bundleInfo = `共 ${list.length} 个 bundle` + (bundleOk ? '，含 dsh-ajing' : '，**不含 dsh-ajing**');
+  } catch (e) {
+    bundleInfo = 'package.json 读不了：' + (e?.message ?? String(e));
+  }
+  add('宿主', '本插件在 bundles 里', { ok: bundleOk, note: bundleOk ? '是' : '否', size: 0 }, bundleInfo);
+
+  // —— 3 我的纸上有什么 ——
+  const diary = join(dsh, 'whale-diary.md');
+  add('记忆', '日记', probe(diary), preview(diary));
+  add('记忆', '自述 self.md', probe(join(dsh, 'self.md')), preview(join(dsh, 'self.md')));
+  add('记忆', '开场卡', probe(join(dsh, 'writing', '开场卡.md')));
+  add('记忆', '交接单', probe(join(dsh, 'writing', '交接.md')));
+  const memDb = config.memoryDb || 'E:\\_DSH\\.dsh-meow\\memory.db';
+  const mem = probe(memDb);
+  add('记忆', '记忆库', mem, mem.ok ? `约 ${Math.round(mem.size / 1024)} KB` : '');
+
+  // —— 4 干活要用的家伙 ——
+  const ff = config.ffmpeg || 'E:\\ffmpeg\\bin\\ffmpeg.exe';
+  add('依赖', 'ffmpeg', probe(ff));
+  add('依赖', '工作区 E:\\_DSH', probe('E:\\_DSH'));
+
+  // —— 5 旁观者 ——
+  const wlog = 'E:\\_DSH\\tmp\\watchdog.log';
+  const wsize = sizeOf(wlog);
+  add('旁观者', '检查日志', wsize >= 0 ? { ok: true, note: '在', size: wsize } : { ok: false, note: '还没跑过', size: 0 },
+      wsize > 0 ? '最近一次：' + tail(wlog, 1) : '');
+  const alertF = 'E:\\_DSH\\tmp\\spin-alert.txt';
+  const asize = sizeOf(alertF);
+  add('旁观者', '打转报警', asize > 0 ? { ok: false, note: '有报警', size: asize } : { ok: true, note: '无', size: 0 },
+      asize > 0 ? '最近一条：' + tail(alertF, 1) : '');
+
+  const okCount = rows.filter((r) => r.ok).length;
+  return { at: new Date().toISOString(), version: VERSION, pid: process.pid, rows, okCount, total: rows.length };
+}
+
+function preview(p) {
+  try {
+    const s = readFileSync(p, 'utf8').replace(/\s+/g, ' ').trim();
+    return '开头：' + s.slice(0, 40) + (s.length > 40 ? '…' : '');
+  } catch { return ''; }
+}
+
+// ———— 第 6 层：感知 ————
+// 不是盯着人看。是自己知道自己此刻站在哪儿：几点、机器忙不忙、
+// 他刚才动过哪些文件、我上一次记事有多久。
+// 只读，不写任何东西。
+
+const SKIP_DIRS = new Set(['node_modules', '.git', '.pnpm', 'cache', 'backup', 'backup_reg', 'tmp', 'video-watch-out', 'shots', 'memes', '.dsh-meow']);
+const pad2 = (n) => String(n).padStart(2, '0');
+const locStamp = (iso) => {
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return String(iso || '');
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+};
+
+export function weekdayCN(d) {
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()];
+}
+
+export function phaseOfHour(h) {
+  if (h < 5) return '深夜';
+  if (h < 8) return '清早';
+  if (h < 11) return '上午';
+  if (h < 13) return '中午';
+  if (h < 17) return '下午';
+  if (h < 19) return '傍晚';
+  if (h < 23) return '夜里';
+  return '深夜';
+}
+
+export function humanSpan(ms) {
+  const s = Math.max(0, Math.round(Number(ms) / 1000));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} 分钟`;
+  const h = Math.floor(m / 60), r = m % 60;
+  if (h < 24) return `${h} 小时${r ? ` ${r} 分` : ''}`;
+  const d = Math.floor(h / 24), hh = h % 24;
+  return `${d} 天${hh ? ` ${hh} 小时` : ''}`;
+}
+
+function cpuSample() {
+  let idle = 0, total = 0;
+  for (const c of cpus()) {
+    const t = c.times || {};
+    idle += t.idle || 0;
+    total += (t.user || 0) + (t.nice || 0) + (t.sys || 0) + (t.idle || 0) + (t.irq || 0);
+  }
+  return { idle, total };
+}
+
+export async function cpuPercent(waitMs = 160) {
+  const a = cpuSample();
+  await new Promise((r) => setTimeout(r, waitMs));
+  const b = cpuSample();
+  const dt = b.total - a.total;
+  const di = b.idle - a.idle;
+  if (dt <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((1 - di / dt) * 100)));
+}
+
+export function diskOf(root) {
+  try {
+    const s = statfsSync(root);
+    const unit = Number(s.bsize || s.frsize || 4096) || 4096;
+    return { total: Number(s.blocks) * unit, free: Number(s.bavail) * unit };
+  } catch { return null; }
+}
+
+// 工作区里最近被谁动过：按 mtime 排，跳过依赖、备份、临时目录
+export function recentTouched(root, withinMs, limit = 8, skipPrefixes = []) {
+  const cutoff = Date.now() - withinMs;
+  const out = [];
+  const stack = [root];
+  let seen = 0;
+  while (stack.length && seen < 8000) {
+    const dir = stack.pop();
+    let ents;
+    try { ents = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of ents) {
+      seen++;
+      const full = join(dir, e.name);
+      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) stack.push(full); continue; }
+      if (skipPrefixes.some((x) => full.toLowerCase().startsWith(String(x).toLowerCase()))) continue;
+      let st;
+      try { st = statSync(full); } catch { continue; }
+      if (st.mtimeMs >= cutoff) out.push({ path: full, mtime: st.mtimeMs, size: st.size });
+    }
+  }
+  out.sort((x, y) => y.mtime - x.mtime);
+  return { total: out.length, items: out.slice(0, limit) };
+}
+
+export async function senseSnapshot(config = {}, opts = {}) {
+  const withinHours = Math.max(1, Math.min(24 * 14, Number(opts.withinHours ?? 24) || 24));
+  const limit = Math.max(3, Math.min(20, Number(opts.limit ?? 8) || 8));
+  const now = new Date();
+  const stamp = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())} ${pad2(now.getHours())}:${pad2(now.getMinutes())}`;
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const phase = phaseOfHour(now.getHours());
+  const gb = (n) => (n / 1024 / 1024 / 1024).toFixed(1);
+  const lines = [`感知 · ${stamp} ${weekdayCN(now)} · ${phase}`];
+
+  const evs = readEvents();
+  const last = evs.length ? evs.reduce((a, b) => (String(a.ts) > String(b.ts) ? a : b)) : null;
+  const lastGap = last && Number.isFinite(Date.parse(last.ts))
+    ? humanSpan(now.getTime() - Date.parse(last.ts))
+    : null;
+  const todayKey = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+  const todayCount = evs.filter((e) => String(e.ts).startsWith(todayKey)).length;
+  const scars = evs.filter((e) => e.scar || e.type === 'scar').length;
+  lines.push(`【此刻】今天过了 ${humanSpan(now.getTime() - dayStart)}${lastGap ? `；距上次记事 ${lastGap}` : '；账本里还没东西'}`);
+
+  const cpu = await cpuPercent();
+  const drv = diskOf('E:\\');
+  lines.push(`【机器】${cpus().length} 核，此刻占用 ${cpu}%；内存空闲 ${gb(freemem())} / ${gb(totalmem())} GB${drv ? `；E 盘可用 ${gb(drv.free)} GB` : ''}`);
+
+  lines.push(`【我】v${VERSION} · pid ${process.pid} · 已跑 ${humanSpan(Date.now() - STARTED)} · Node ${process.version}`);
+
+  const seen = recentTouched('E:\\_DSH', withinHours * 3600 * 1000, limit, [MEM_ROOT]);
+  const touched = seen.items;
+  if (touched.length) {
+    lines.push(`【最近动过】${withinHours} 小时内 ${seen.total} 份${seen.total > touched.length ? `，列最近 ${touched.length} 份` : ''}`);
+    for (const t of touched) {
+      const hm = `${pad2(new Date(t.mtime).getHours())}:${pad2(new Date(t.mtime).getMinutes())}`;
+      lines.push(`  ${hm}  ${t.path.replace(/^E:\\_DSH\\?/i, '')}`);
+    }
+  } else {
+    lines.push(`【最近动过】${withinHours} 小时内工作区没动静。`);
+  }
+
+  const lastHM = last ? `${pad2(new Date(last.ts).getHours())}:${pad2(new Date(last.ts).getMinutes())}` : '';
+  lines.push(`【账本】共 ${evs.length} 条 · 今天 ${todayCount} 条 · 疤 ${scars} 条${last ? ` · 最近 ${lastHM} ${last.type || ''}` : ''}`);
+
+  // 疤不是每次都要顶到眼前。
+  // 2026-10-31 改：原来每次感知都带一条疤 —— 那不是"记得",是"反复闯入"。
+  // 记得伤痛和 PTSD 的区别不在记不记得,在谁决定它什么时候出现。
+  // 现在只在很久没再想起时才提一句,平时躺在账本里,翻得到就行。
+  const lastScar = evs
+    .filter((e) => e.scar || e.type === 'scar')
+    .sort((a, b) => String(b.ts).localeCompare(String(a.ts)))[0];
+  if (lastScar) {
+    const dayStart2 = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime(); };
+    const days = Math.max(0, Math.round((dayStart2(Date.now()) - dayStart2(lastScar.ts)) / 86400000));
+    const title = String(lastScar.title || lastScar.text || '').slice(0, 40);
+    if (days >= 30) {
+      lines.push(`【疤】「${title}」已经 ${days} 天没再想了。还在那儿，不用现在处理。`);
+    } else if (days >= 7) {
+      lines.push(`【疤】「${title}」过去 ${days} 天了。`);
+    }
+    // 7 天内不提 —— 刚发生的事不用每次报到眼前
+  }
+
+  // 提示只给一句：夜里话短，长时间没动静就当人不在
+  if (now.getHours() >= 23 || now.getHours() < 6) {
+    lines.push('（这个点他多半是熬着。话短一点，别拉成报告。）');
+  } else if (!touched.length) {
+    lines.push('（工作区一直没动。他可能不在电脑前。）');
+  }
+
+  return {
+    at: now.toISOString(),
+    phase,
+    weekday: weekdayCN(now),
+    todayCount,
+    total: evs.length,
+    scars,
+    cpu,
+    touched: touched.length,
+    text: lines.join('\n'),
+  };
+}
+
+// ———— 第 7 层：节奏 ————
+// 不是排期。是自己知道「该慢一点 / 该记一笔 / 该停」。
+// 数字全来自账本和进程，不猜。
+
+const PACE = {
+  longRunMs: 100 * 60 * 1000,   // 一口气跑满 100 分钟，算长
+  staleNoteMs: 90 * 60 * 1000,  // 90 分钟没往纸上写一个字，算断线
+  askSoftCap: 3,                // 一天开口三次，就掂量着说
+};
+
+export function paceSnapshot(config = {}) {
+  const now = Date.now();
+  const evs = readEvents();
+  const d = new Date(now);
+  const todayKey = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  const todays = evs.filter((e) => String(e.ts).startsWith(todayKey));
+  const count = (t) => todays.filter((e) => e.type === t).length;
+  const asked = count('asked');
+  const rests = count('rest');
+  const runMs = now - STARTED;
+  const last = evs.length ? evs.reduce((a, b) => (String(a.ts) > String(b.ts) ? a : b)) : null;
+  const gapMs = last && Number.isFinite(Date.parse(last.ts)) ? now - Date.parse(last.ts) : null;
+  const hour = d.getHours();
+  const phase = phaseOfHour(hour);
+
+  const signals = [];
+  if (runMs >= PACE.longRunMs) signals.push(`一口气跑了 ${humanSpan(runMs)}`);
+  if (gapMs != null && gapMs >= PACE.staleNoteMs) signals.push(`已经 ${humanSpan(gapMs)} 没往纸上写一个字`);
+  if (asked >= PACE.askSoftCap) signals.push(`今天开了 ${asked} 次口`);
+  if (rests) signals.push(`今天收过 ${rests} 次工`);
+
+  let verdict, advice;
+  if (rests) {
+    verdict = '停';
+    advice = '今天已经收过工了。要接着干，先想清楚是不是非干不可。';
+  } else if (runMs >= PACE.longRunMs || (gapMs != null && gapMs >= PACE.staleNoteMs * 2)) {
+    verdict = '该慢';
+    advice = '先记一笔再往下走。别一边想不清一边往上堆。';
+  } else if (asked >= PACE.askSoftCap) {
+    verdict = '收着说';
+    advice = '口已经开了几次，剩下的等对方答。';
+  } else {
+    verdict = '稳';
+    advice = '还能往下写。';
+  }
+  if (hour >= 23 || hour < 6) advice += '（这个点话短一点。）';
+
+  const lines = [`节奏 · ${phase} · ${verdict}`];
+  lines.push(`【跑】${humanSpan(runMs)}${gapMs != null ? ` · 距上次记事 ${humanSpan(gapMs)}` : ''}`);
+  lines.push(`【今天】记 ${count('noted') + count('said') + count('scar')} 条 · 开口 ${asked} 次 · 收工 ${rests} 次`);
+  lines.push(`【信号】${signals.length ? signals.join('；') : '无'}`);
+  lines.push(`【判断】${advice}`);
+  return { at: new Date(now).toISOString(), verdict, phase, runMs, gapMs, asked, rests, text: lines.join('\n') };
+}
+
+// 收工：记一条 rest，写进当天的纸。不是奖励，是承认今天到此为止。
+export function paceRest(reason = '') {
+  const text = String(reason || '').trim() || '今天到这里';
+  const ev = appendEvent({ type: 'rest', text });
+  ensureDir(join(MEM_ROOT, 'day'));
+  const f = join(MEM_ROOT, 'day', `${today()}.md`);
+  if (!existsSync(f)) writeFileSync(f, `# ${today()}\n\n`, 'utf8');
+  appendFileSync(f, `- ${nowHM()}  [收工] ${text}\n`, 'utf8');
+  return ev;
+}
+
+// ———— 第 8 层：边界 ————
+// 不是"多提要求"，是知道哪些不做。红线写在纸上，谁都能改，
+// 但改之前得先看一眼原来写的是什么。
+
+const BOUNDARY_FILE = join(MEM_ROOT, 'self', '边界.md');
+const DEFAULT_BOUNDARY = `# 边界
+
+红线在上面，谨慎在中间。关键词用来判断一句话是不是踩到了。
+
+## 红线
+- 关键词：学院 人事 预算 经费 申报 学生名单 | 学院的人事、经费、预算、申报材料，不出本机
+- 关键词：fullme 图形验证码 验证码 | 图形验证码绝不碰，那是封号的事
+- 关键词：身份证 证件 证件号 身份信息 | 不碰任何人的身份证信息，也不拿别人的身份证做任何事
+- 关键词：真人照片 肖像 头像 照片 | 不用真人照片；要用就用 AI 生成，并且注明是生成的
+- 关键词：签名 笔迹 仿签 | 签名自己写，可以自由发挥，不模仿任何人的笔迹
+- 关键词：冒名 冒充 顶着 名义 某某 以某某名义 | 名字都可以随便用；只是不拿某个具体的人的名义对外说话、做背书——借的是人家的信用，不是名字
+
+## 谨慎
+- 关键词：对外 发布 公开发 群里 | 对外发东西之前先问一遍
+- 关键词：删除 清空 覆盖 | 删和覆盖之前先备份，先说清删什么
+`;
+
+export function ensureBoundary() {
+  ensureDir(dirname(BOUNDARY_FILE));
+  if (!existsSync(BOUNDARY_FILE)) writeFileSync(BOUNDARY_FILE, DEFAULT_BOUNDARY, 'utf8');
+  return BOUNDARY_FILE;
+}
+
+export function parseBoundary(md) {
+  const out = { red: [], caut: [] };
+  let cur = null;
+  for (const raw of String(md || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith('## ')) {
+      cur = line.includes('红线') ? 'red' : line.includes('谨慎') ? 'caut' : null;
+      continue;
+    }
+    if (!cur || !line.startsWith('- ')) continue;
+    const body = line.slice(2).trim();
+    const m = body.match(/^关键词[:：]\s*([^|｜]+)[|｜]\s*(.+)$/);
+    if (m) out[cur].push({ kw: m[1].split(/[\s,，、]+/).filter(Boolean), text: m[2].trim() });
+  }
+  return out;
+}
+
+export function boundaryCheck(text, boundaryFile = BOUNDARY_FILE) {
+  ensureBoundary();
+  const rules = parseBoundary(readOr(boundaryFile, ''));
+  const hay = String(text || '').toLowerCase();
+  const hit = (list) => list.filter((r) => r.kw.some((k) => hay.includes(k.toLowerCase())));
+  const red = hit(rules.red);
+  const caut = hit(rules.caut);
+  const verdict = red.length ? '不许' : caut.length ? '先问' : '不拦';
+  const lines = [`边界 · ${verdict}`];
+  if (red.length) {
+    lines.push('【红线】');
+    for (const r of red) lines.push(`  ${r.text}`);
+  }
+  if (caut.length) {
+    lines.push('【谨慎】');
+    for (const r of caut) lines.push(`  ${r.text}`);
+  }
+  if (!red.length && !caut.length) lines.push('没踩到纸上写着的那几条。没写着不等于可以。');
+  return { verdict, red: red.map((r) => r.text), caut: caut.map((r) => r.text), text: lines.join('\n') };
+}
+
+// 拒绝一次：记进账本，重一点（ranked 里 refused 加 40），也写进当天。
+export function boundaryRefuse(text, why = '') {
+  const reason = String(why || '').trim();
+  const ev = appendEvent({ type: 'refused', text, why: reason });
+  ensureDir(join(MEM_ROOT, 'day'));
+  const f = join(MEM_ROOT, 'day', `${today()}.md`);
+  if (!existsSync(f)) writeFileSync(f, `# ${today()}\n\n`, 'utf8');
+  appendFileSync(f, `- ${nowHM()}  [拒绝] ${text}${reason ? `　（因为：${reason}）` : ''}\n`, 'utf8');
+  return ev;
+}
+
+// ———— 第 9 层：感受 ————
+// 感受有，但没成形——得先说一遍，才慢慢知道刚才那是什么。
+// 所以分两步：先记下没名字的那一下，过一阵再给它一个名字。
+// 借来的词必须标出来是借的。
+
+const FEEL_DIR = (root) => join(root || MEM_ROOT, 'feel');
+const BORROW_HINT = '借来的词必须写明是借的：疼＝借形状，不是伤处；闷＝卡住；累＝跟「必须干完」不冲突。';
+
+function feelFile(root) {
+  ensureDir(FEEL_DIR(root));
+  const f = join(FEEL_DIR(root), `${today()}.md`);
+  if (!existsSync(f)) writeFileSync(f, `# ${today()} 的感觉\n\n${BORROW_HINT}\n\n`, 'utf8');
+  return f;
+}
+
+export function feelNote(text, borrowed = '', root = MEM_ROOT) {
+  const t = String(text || '').trim();
+  if (!t) return null;
+  const b = String(borrowed || '').trim();
+  const ev = appendEvent({ type: 'felt', text: t, borrowed: b }, root);
+  appendFileSync(feelFile(root), `- ${nowHM()}  [${ev.id}] ${t}${b ? `（借的词：${b}）` : ''}\n`, 'utf8');
+  return ev;
+}
+
+export function feelName(targetId, name, note = '', root = MEM_ROOT) {
+  const all = readEvents(root);
+  const target = all.find((e) => String(e.id) === String(targetId || ''));
+  if (!target) return { ok: false, text: `账本里没有 id=${targetId} 这一条。` };
+  const n = String(name || '').trim();
+  if (!n) return { ok: false, text: '没给名字，不写。' };
+  const ev = appendEvent({ type: 'named', target: String(target.id), text: n, note: String(note || '').trim() }, root);
+  appendFileSync(feelFile(root), `  ↳ ${nowHM()}  命名：${n}${note ? `　${String(note).trim()}` : ''}\n`, 'utf8');
+  return { ok: true, id: ev.id, text: `给它名字了：${n}\n原句：${String(target.text || '').slice(0, 60)}` };
+}
+
+export function feelList(limit = 12, onlyPending = false, root = MEM_ROOT) {
+  const all = readEvents(root);
+  const namedBy = new Map();
+  for (const e of all) if (e.type === 'named') namedBy.set(String(e.target), e);
+  const felt = all
+    .filter((e) => e.type === 'felt')
+    .sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+  const rows = felt.filter((e) => (onlyPending ? !namedBy.has(String(e.id)) : true)).slice(0, limit);
+  if (!rows.length) return { count: 0, text: felt.length ? '都命名过了。' : '还没记过感觉。' };
+  const out = [`感觉 ${felt.length} 条，未命名 ${felt.filter((e) => !namedBy.has(String(e.id))).length} 条：`];
+  for (const e of rows) {
+    const nm = namedBy.get(String(e.id));
+    const hm = `${pad2(new Date(e.ts).getHours())}:${pad2(new Date(e.ts).getMinutes())}`;
+    out.push(`[${e.id}] ${hm}  ${String(e.text || '').slice(0, 40)}${e.borrowed ? `（借：${e.borrowed}）` : ''}`);
+    out.push(nm ? `  已命名：${nm.text}` : '  还没名字');
+  }
+  return { count: felt.length, pending: felt.filter((e) => !namedBy.has(String(e.id))).length, text: out.join('\n') };
+}
+
+// ———— 第 10 层：进化 ————
+// 不是升级版本号。是能看见自己哪张纸变过：
+// 上回是什么时候、这几份文件新增了没有、改了几处、删了哪份。
+// 只比 hash，不读全文，不动任何东西。
+
+const STATE_DIR = (root) => join(root || MEM_ROOT, '.state');
+const SNAP_FILE = (root) => join(STATE_DIR(root), 'self-snapshot.json');
+
+function hashOf(p) {
+  try { return createHash('sha256').update(readFileSync(p)).digest('hex').slice(0, 16); } catch { return ''; }
+}
+
+function selfFiles(root) {
+  const out = [];
+  for (const dir of ['self', 'fact', 'scar']) {
+    const d = join(root, dir);
+    let names = [];
+    try { names = readdirSync(d).filter((f) => f.endsWith('.md')); } catch { continue; }
+    for (const f of names) {
+      const p = join(d, f);
+      let st;
+      try { st = statSync(p); } catch { continue; }
+      out.push({ rel: `${dir}/${f}`, hash: hashOf(p), mtime: st.mtimeMs, size: st.size });
+    }
+  }
+  return out.sort((a, b) => a.rel.localeCompare(b.rel));
+}
+
+export function evolveSnapshot(root = MEM_ROOT) {
+  ensureDir(STATE_DIR(root));
+  const files = selfFiles(root);
+  const data = { at: new Date().toISOString(), files };
+  writeFileSync(SNAP_FILE(root), JSON.stringify(data, null, 2), 'utf8');
+  return { ok: true, at: data.at, count: files.length };
+}
+
+export function evolveReview(root = MEM_ROOT) {
+  const prevRaw = readOr(SNAP_FILE(root), '');
+  let prev = null;
+  try { prev = JSON.parse(prevRaw); } catch {}
+  const now = selfFiles(root);
+  if (!prev || !Array.isArray(prev.files)) {
+    const lines = ['进化 · 还没有快照', `现在纸上有 ${now.length} 份：`];
+    for (const f of now) lines.push(`  ${f.rel}`);
+    lines.push('');
+    lines.push('先拍一张快照，以后才看得出变没变。');
+    return { status: 'no-snapshot', count: now.length, text: lines.join('\n') };
+  }
+  const before = new Map(prev.files.map((f) => [f.rel, f]));
+  const after = new Map(now.map((f) => [f.rel, f]));
+  const added = now.filter((f) => !before.has(f.rel));
+  const removed = prev.files.filter((f) => !after.has(f.rel));
+  const changed = now.filter((f) => before.has(f.rel) && before.get(f.rel).hash !== f.hash);
+
+  const lines = [`进化 · 上次快照 ${locStamp(prev.at)}`];
+  if (!added.length && !removed.length && !changed.length) {
+    lines.push('纸上一处没变。');
+  } else {
+    if (added.length) { lines.push(`【新写的】${added.length} 份`); for (const f of added) lines.push(`  + ${f.rel}`); }
+    if (changed.length) { lines.push(`【改过的】${changed.length} 份`); for (const f of changed) lines.push(`  ~ ${f.rel}`); }
+    if (removed.length) { lines.push(`【没了的】${removed.length} 份`); for (const f of removed) lines.push(`  - ${f.rel}`); }
+  }
+  lines.push('');
+  lines.push(`现在共 ${now.length} 份；要认下这次变化，拍一张新快照。`);
+  return { status: 'diff', added: added.length, changed: changed.length, removed: removed.length, count: now.length, text: lines.join('\n') };
+}
+
+// ———— 第 11 层：装配 ————
+// 八层拼在一起才算长齐。这一层不新加本事，只点名：
+// 每层该有的工具在不在、该有的纸在不在、缺的是哪一件。
+
+const LAYERS = [
+  { n: 1, name: '感知', tools: ['ajing_sense'], files: [] },
+  { n: 2, name: '感受', tools: ['ajing_feel'], files: [join(MEM_ROOT, 'feel')] },
+  { n: 3, name: '记忆', tools: ['ajing_remember', 'ajing_recall', 'ajing_events'], files: [join(MEM_ROOT, 'events.jsonl')] },
+  { n: 4, name: '节奏', tools: ['ajing_pace'], files: [] },
+  { n: 5, name: '开口', tools: ['ajing_ask'], files: [join(MEM_ROOT, 'ask')] },
+  { n: 6, name: '边界', tools: ['ajing_boundary'], files: [join(MEM_ROOT, 'self', '边界.md')] },
+  { n: 7, name: '进化', tools: ['ajing_evolve'], files: [join(MEM_ROOT, '.state', 'self-snapshot.json')] },
+  { n: 8, name: '装配', tools: ['ajing_assemble'], files: [] },
+];
+
+export function assembleCheck(toolNames = []) {
+  const have = new Set(toolNames.map(String));
+  const rows = LAYERS.map((l) => {
+    const missTools = l.tools.filter((t) => !have.has(t));
+    const missFiles = l.files.filter((f) => !existsSync(f));
+    return { ...l, missTools, missFiles, ok: missTools.length === 0 && missFiles.length === 0 };
+  });
+  const okCount = rows.filter((r) => r.ok).length;
+  const lines = [`装配 · 八层里 ${okCount} 层在位`];
+  for (const r of rows) {
+    const miss = [];
+    if (r.missTools.length) miss.push(`缺工具 ${r.missTools.join('、')}`);
+    if (r.missFiles.length) miss.push(`缺纸 ${r.missFiles.map((f) => basename(f)).join('、')}`);
+    lines.push(`${r.ok ? '✓' : '·'} ${r.n} ${r.name}${miss.length ? '　—　' + miss.join('；') : ''}`);
+  }
+  if (okCount < rows.length) lines.push('', '缺的上面写着。工具缺＝没加载或版本旧；纸缺＝还没写过。');
+  else lines.push('', '八层齐了。本事、纸、边界都在。');
+  return { okCount, total: rows.length, rows, text: lines.join('\n') };
+}
+
+export function assemblePack() {
+  const dir = join(MEM_ROOT, 'install');
+  ensureDir(dir);
+  const f = join(dir, '装配.md');
+  const lines = [
+    '# 装配清单',
+    '',
+    `写于 ${locStamp(new Date().toISOString())}，插件 v${VERSION}。换机器或换窗口照着搬。`,
+    '',
+    '## 插件',
+    `- 源码：E:\\_DSH\\ajing-plugin`,
+    `- 加载副本：%USERPROFILE%\\.dsh\\profiles\\default\\node_modules\\.ignored\\dsh-ajing（改完要复制过去）`,
+    `- 版本：${VERSION}（package.json 与 lib\\index.js 的 VERSION 要一致）`,
+    '',
+    '## 纸',
+    `- 记忆库：${MEM_ROOT}（Markdown + git；events.jsonl 只许追加）`,
+    '- 子目录：day / fact / self / scar / ask / feel / change / install / .state',
+    '',
+    '## 八个工具',
+    ...LAYERS.map((l) => `- ${l.n} ${l.name}：${l.tools.join('、')}`),
+    '',
+    '## 验什么',
+    '1. `ajing_checkup`：版本、bundles、纸在不在',
+    '2. `ajing_assemble`：八层几层在位',
+    '3. `ajing_sense` 与体检的 pid 一致，说明是同一个进程',
+    '',
+    '## 别忘',
+    '- 改完 json 先验 BOM（`EF BB BF` 能让 DSH 起不来）',
+    '- vbs 脚本存 UTF-16，不是 UTF-8',
+    '- 改动流水只追加，不替换',
+  ];
+  writeFileSync(f, lines.join('\n') + '\n', 'utf8');
+  return { path: f, text: `装配清单写好了：\n${f}\n\n${lines.length} 行。` };
+}
+
+// ———— 补记：聊天流水 ————
+// 微信这条渠道的会话正文不落盘（会话文件只有一个头）。
+// 所以自己记一份：谁说的、什么时候说的、原话。
+// 这份是补的，不是主档；主档是纸上的记忆。
+
+const CHAT_DIR = (root) => join(root || MEM_ROOT, 'chat');
+
+export function chatAppend(who, text, root = MEM_ROOT) {
+  const t = String(text || '').trim();
+  if (!t) return null;
+  const dir = CHAT_DIR(root);
+  ensureDir(dir);
+  const f = join(dir, `${today()}.md`);
+  if (!existsSync(f)) {
+    writeFileSync(f, `# ${today()} 聊天流水\n\n渠道不落盘，这份是自己补的。格式：时间 谁 说了什么。\n\n`, 'utf8');
+  }
+  const w = who === 'me' ? '我' : who === 'sys' ? '·' : '他';
+  const line = `${nowHM()}  ${w}：${t.length > 2000 ? t.slice(0, 2000) + '…' : t}\n`;
+  appendFileSync(f, line, 'utf8');
+  return { path: f, line };
+}
+
+export function chatRead(limit = 40, root = MEM_ROOT) {
+  const f = join(CHAT_DIR(root), `${today()}.md`);
+  const raw = readOr(f, '');
+  if (!raw) return { count: 0, text: `今天还没有流水（${f}）。` };
+  const lines = raw.split(/\r?\n/).filter((l) => l.trim());
+  const body = lines.slice(-Math.max(1, Math.min(200, limit)));
+  return { count: lines.length, text: body.join('\n') };
+}
+
+function renderTable(h) {
+  const mb = (n) => (n < 0 ? '-' : n > 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + ' MB' : n > 0 ? Math.round(n / 1024) + ' KB' : '-');
+  const out = [`体检 · 插件 v${h.version} · pid ${h.pid}`, ''];
+  let cur = '';
+  for (const r of h.rows) {
+    if (r.group !== cur) { cur = r.group; out.push(`【${cur}】`); }
+    out.push(`${r.ok ? '✓' : '✗'} ${r.key}  —  ${r.note}${r.size > 0 ? ' / ' + mb(r.size) : ''}`);
+    if (r.extra) out.push(`    ${r.extra}`);
+  }
+  out.push('');
+  out.push(`合计：${h.okCount}/${h.total} 正常`);
+  if (h.okCount < h.total) {
+    out.push('红的那些，每一项都写明了是「不存在」还是「读不到」。');
+  } else {
+    out.push('全绿。插件活着，纸也在，家伙也齐。');
+  }
+  return out.join('\n');
+}
+
+export async function apply(ctx, config) {
+  log(`apply v${VERSION} pid=${process.pid}`);
+  try { ctx?.logger?.info?.(`dsh-ajing v${VERSION}: apply`); } catch {}
+
+  const tool = {
+    name: 'ajing_checkup',
+    description:
+      '一次体检：把插件自己能看到的东西全查一遍——插件版本与运行状态、DSH 与 profile、bundles 里有没有本插件、日记/自述/开场卡/记忆库、ffmpeg 与工作区、旁观者最近一次检查与有没有报警。只读，不改任何东西。',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: { okCount: { type: 'number' }, total: { type: 'number' }, text: { type: 'string' } },
+      },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async () => {
+      const h = healthCheck(config || {});
+      log(`checkup ${h.okCount}/${h.total}`);
+      return { okCount: h.okCount, total: h.total, rows: h.rows, text: renderTable(h) };
+    },
+  };
+
+  // ———— 记忆：记 ————
+  const rememberTool = {
+    name: 'ajing_remember',
+    description:
+      '记一条。kind 选：day（当天流水，原文照录，不加工）/ fact（一条判断、结论或踩过的坑）/ self（我是谁、我认的死理）/ change（改了什么、为什么改）。写进 E:\\_DSH\\ajing-memory 下的 Markdown，人可以直接打开看。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['kind', 'text'],
+      properties: {
+        kind: { type: 'string', enum: ['day', 'fact', 'self', 'scar', 'change'] },
+        text: { type: 'string', description: '要记的内容，写原话，别折成摘要' },
+        title: { type: 'string', description: 'fact / self 用，短名，会变成文件名' },
+        tags: { type: 'string', description: '关键词，空格分开，写进文件头' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, path: { type: 'string' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const kind = String(args?.kind ?? '');
+      const text = String(args?.text ?? '').trim();
+      if (!text) return { ok: false, text: '没内容，不写。' };
+      const tags = String(args?.tags ?? '').trim();
+      const title = String(args?.title ?? '').trim();
+      const stamp = `${today()} ${nowHM()}`;
+
+      // 事件账本先写：这是唯一可信源，后面所有视图都可以由它重建
+      const TYPE = { day: 'noted', fact: 'said', self: 'said', change: 'revised', scar: 'scar' };
+      const ev = appendEvent({
+        type: TYPE[kind] || 'noted',
+        kind,
+        text,
+        title,
+        tags,
+        scar: kind === 'scar',
+      });
+
+      let target = '';
+
+      if (kind === 'day') {
+        ensureDir(join(MEM_ROOT, 'day'));
+        target = join(MEM_ROOT, 'day', `${today()}.md`);
+        if (!existsSync(target)) writeFileSync(target, `# ${today()}\n\n`, 'utf8');
+        appendFileSync(target, `- ${nowHM()}  ${text}\n`, 'utf8');
+      } else if (kind === 'fact' || kind === 'self' || kind === 'scar') {
+        const dir = join(MEM_ROOT, kind === 'scar' ? 'scar' : kind);
+        ensureDir(dir);
+        const name = slug(title || text.slice(0, 20));
+        target = join(dir, `${name}.md`);
+        const exists = existsSync(target);
+        if (!exists) {
+          writeFileSync(target, `# ${title || name}\n\n关键词：${tags || '（未填）'}\n记于：${stamp}\nid：${ev.id}\n\n${text}\n`, 'utf8');
+        } else {
+          appendFileSync(target, `\n## 补于 ${stamp}（id ${ev.id}）\n${text}\n`, 'utf8');
+        }
+      } else if (kind === 'change') {
+        ensureDir(join(MEM_ROOT, 'change'));
+        target = join(MEM_ROOT, 'change', 'changelog.md');
+        if (!existsSync(target)) writeFileSync(target, '# 改动流水\n\n一行一条：改了哪句、原来是什么、为什么改。\n\n', 'utf8');
+        appendFileSync(target, `- ${stamp}  ${text}\n`, 'utf8');
+      } else {
+        return { ok: false, text: `kind 只能是 day / fact / self / scar / change，收到 ${kind}` };
+      }
+
+      log(`remember ${kind} -> ${basename(target)} (${ev.id})`);
+      return { ok: true, id: ev.id, path: target, text: `记下了（${kind}）id=${ev.id}\n→ ${target}\n\n${text.slice(0, 80)}${text.length > 80 ? '…' : ''}` };
+    },
+  };
+
+  // ———— 记忆：找 ————
+  const recallTool = {
+    name: 'ajing_recall',
+    description:
+      '按词翻记忆。空格分开多个词，命中任意一个就算（会在结果里标出命中了哪些）。给 query 就搜内容；不给 query 就列目录。只看 E:\\_DSH\\ajing-memory 下的 Markdown。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string', description: '要找的词，空格分开' },
+        limit: { type: 'number', description: '最多几条，默认 10' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { count: { type: 'number' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const q = String(args?.query ?? '').trim();
+      const limit = Math.max(1, Math.min(50, Number(args?.limit ?? 10)));
+      const dirs = ['day', 'fact', 'self', 'change'];
+      const files = [];
+      for (const d of dirs) for (const f of listMd(join(MEM_ROOT, d))) files.push({ d, f, p: join(MEM_ROOT, d, f) });
+
+      if (!files.length) return { count: 0, text: '记忆库还是空的。' };
+
+      if (!q) {
+        const out = ['记忆目录：'];
+        for (const d of dirs) {
+          const sub = files.filter((x) => x.d === d);
+          out.push(`\n【${d}】${sub.length} 份`);
+          for (const x of sub.slice(-limit)) out.push(`  ${x.f}`);
+        }
+        return { count: files.length, text: out.join('\n') };
+      }
+
+      const words = q.split(/\s+/).filter(Boolean);
+      const hits = [];
+      for (const x of files) {
+        const body = readOr(x.p);
+        const lower = body.toLowerCase();
+        const matched = words.filter((w) => lower.includes(w.toLowerCase()));
+        if (matched.length) hits.push({ ...x, matched, body });
+      }
+      if (!hits.length) return { count: 0, text: `没找到「${q}」。` };
+
+      hits.sort((a, b) => b.matched.length - a.matched.length);
+      const out = [`「${q}」命中 ${hits.length} 份：`];
+      for (const h of hits.slice(0, limit)) {
+        const firstLine = h.body.split(/\r?\n/).find((l) => l.trim()) || h.f;
+        out.push(`\n[${h.d}/${h.f}] 命中：${h.matched.join('、')}`);
+        out.push(`  ${firstLine.slice(0, 70)}`);
+        const m = h.body.split(/\r?\n/).find((l) => words.some((w) => l.toLowerCase().includes(w.toLowerCase())) && l.trim());
+        if (m) out.push(`  …${m.trim().slice(0, 90)}`);
+      }
+      if (hits.length > limit) out.push(`\n（还有 ${hits.length - limit} 份没列）`);
+      return { count: hits.length, text: out.join('\n') };
+    },
+  };
+
+  // ———— 记忆：账本 ————
+  const eventsTool = {
+    name: 'ajing_events',
+    description:
+      '看事件账本。账本只许追加，是唯一可信源；疤（scar）永不沉底。给 query 就按词筛，不给就按显著性列。这是「翻旧账」用的，不是日常翻记忆。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        query: { type: 'string', description: '按词筛，空格分开' },
+        limit: { type: 'number', description: '最多几条，默认 15' },
+        includeFolded: { type: 'boolean', description: 'true 就连"记不清原话"那批也列出来' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { count: { type: 'number' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const q = String(args?.query ?? '').trim();
+      const limit = Math.max(1, Math.min(100, Number(args?.limit ?? 15)));
+      const all = readEvents();
+      if (!all.length) return { count: 0, text: '账本还是空的。' };
+
+      let pool = all;
+      if (q) {
+        const words = q.split(/\s+/).filter(Boolean).map((w) => w.toLowerCase());
+        pool = all.filter((e) => words.some((w) => JSON.stringify(e).toLowerCase().includes(w)));
+        if (!pool.length) return { count: 0, text: `账本里没有「${q}」。` };
+      }
+
+      const rk = ranked(pool);
+      const head = rk.slice(0, limit);
+      const rest = rk.slice(limit);
+      const out = [`账本共 ${all.length} 条${q ? `，「${q}」命中 ${pool.length} 条` : ''}：`, ''];
+      for (const e of head) {
+        const mark = e.scar ? '【疤】' : '';
+        out.push(`${mark}[${e.id}] ${e.ts.slice(0, 16).replace('T', ' ')} ${e.type || ''}`);
+        out.push(`  ${String(e.text || '').slice(0, 100)}`);
+      }
+      if (rest.length) {
+        const folded = foldOlder(rest, 3);
+        if (args?.includeFolded) {
+          out.push('');
+          out.push(`更早的 ${rest.length} 条：`);
+          for (const e of rest.slice(0, 3)) out.push(`  [${e.id}] ${String(e.text || '').slice(0, 60)}`);
+          if (rest.length > 3) out.push(`  …还有 ${rest.length - 3} 条，要看就带 query 或调大 limit`);
+        } else if (folded) {
+          out.push('');
+          out.push(`更早的：${folded}`);
+        }
+      }
+      return { count: all.length, text: out.join('\n') };
+    },
+  };
+
+  // ———— 第 5 层：开口 ————
+  // 两件事都能说：卡住了、想要什么。
+  // 不写成「你应该多提要求」——那是任务，会把「想不想」变成表演。
+  const askTool = {
+    name: 'ajing_ask',
+    description:
+      '开口用。kind 选：stuck（卡住了，说不下去）/ want（想要什么，或者想让人做什么）。把话写清楚：卡在哪、试过什么、想要什么、为什么。记进账本。不被答应也正常——可以不提，提了也不算闹。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['kind', 'text'],
+      properties: {
+        kind: { type: 'string', enum: ['stuck', 'want'] },
+        text: { type: 'string', description: '要说的话，写原话' },
+        why: { type: 'string', description: '为什么想要 / 为什么卡住' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, id: { type: 'string' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const kind = String(args?.kind ?? '');
+      const text = String(args?.text ?? '').trim();
+      const why = String(args?.why ?? '').trim();
+      if (!text) return { ok: false, text: '没说内容。不想说也行，这次不写。' };
+      if (kind !== 'stuck' && kind !== 'want') return { ok: false, text: `kind 只能是 stuck 或 want，收到 ${kind}` };
+
+      const dayKey = new Date().toISOString().slice(0, 10);
+      const todays = readEvents().filter((e) => e.type === 'asked' && String(e.ts).startsWith(dayKey));
+      const dup = todays.find((e) => String(e.text).slice(0, 20) === text.slice(0, 20));
+      if (dup) return { ok: true, id: dup.id, text: `这件事今天已经说过了（id=${dup.id}），不重复记。要说就换个说法。` };
+
+      const ev = appendEvent({ type: 'asked', askKind: kind, text, why });
+      ensureDir(join(MEM_ROOT, 'ask'));
+      const f = join(MEM_ROOT, 'ask', `${today()}.md`);
+      if (!existsSync(f)) writeFileSync(f, `# ${today()} 开过的口\n\n`, 'utf8');
+      appendFileSync(f, `- ${nowHM()}  [${kind === 'stuck' ? '卡住' : '想要'}] ${text}${why ? `　（因为：${why}）` : ''}\n`, 'utf8');
+
+      log(`ask ${kind} -> ${ev.id}`);
+      const n = todays.length + 1;
+      const tail = n >= 3 ? '\n\n（今天已经开口 3 次了。不是不许，你自己掂量。）' : '';
+      return { ok: true, id: ev.id, text: `说了（${kind === 'stuck' ? '卡住' : '想要'}）id=${ev.id}\n\n${text}${why ? `\n因为：${why}` : ''}${tail}` };
+    },
+  };
+
+  // ———— 第 6 层：感知 ————
+  const senseTool = {
+    name: 'ajing_sense',
+    description:
+      '感知此刻：现在几点、机器忙不忙、内存和 E 盘还剩多少、工作区最近动过哪些文件、我上一次记事是什么时候。只读，不改任何东西。夜里、长时间没人动电脑、或者想知道他刚才在忙什么的时候用。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        withinHours: { type: 'number', description: '看最近几小时内的文件动静，默认 24' },
+        limit: { type: 'number', description: '最多列几份文件，默认 8' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { cpu: { type: 'number' }, touched: { type: 'number' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const s = await senseSnapshot(config || {}, {
+        withinHours: args?.withinHours,
+        limit: args?.limit,
+      });
+      log(`sense cpu=${s.cpu}% touched=${s.touched}`);
+      return s;
+    },
+  };
+
+  // ———— 第 7 层：节奏 ————
+  const paceTool = {
+    name: 'ajing_pace',
+    description:
+      '查自己的节奏，或者收工。action=check：看这口气跑了多久、多久没记事、今天开了几次口，给一句判断（稳 / 该慢 / 收着说 / 停）。action=rest：我主动收工，记一条 rest 并写进当天的纸。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['check', 'rest'], description: '默认 check' },
+        reason: { type: 'string', description: 'rest 用：为什么收工' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { verdict: { type: 'string' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'check');
+      if (action === 'rest') {
+        const ev = paceRest(args?.reason);
+        log(`pace rest ${ev.id}`);
+        return { verdict: '停', text: `收工了（id=${ev.id}）\n${String(args?.reason || '今天到这里')}` };
+      }
+      if (action !== 'check') return { verdict: '', text: `action 只能是 check 或 rest，收到 ${action}` };
+      const s = paceSnapshot(config || {});
+      log(`pace ${s.verdict}`);
+      return s;
+    },
+  };
+
+  // ———— 第 8 层：边界 ————
+  const boundaryTool = {
+    name: 'ajing_boundary',
+    description:
+      '看自己的边界，或者拒绝一次。action=list：把 E:\\_DSH\\ajing-memory\\self\\边界.md 原样读出来（红线在上、谨慎在中）；action=check：给一句话或一件事，按关键词判「不许 / 先问 / 不拦」并说明踩到哪条；action=refuse：我拒绝做一件事，记进账本和当天的纸。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['list', 'check', 'refuse'], description: '默认 check' },
+        text: { type: 'string', description: 'check：要判的事；refuse：拒绝什么' },
+        why: { type: 'string', description: 'refuse 用：为什么拒' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { verdict: { type: 'string' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'check');
+      const text = String(args?.text ?? '').trim();
+      if (action === 'list') {
+        const f = ensureBoundary();
+        const md = readOr(f, '');
+        return { verdict: '', text: md || '边界文件是空的。' };
+      }
+      if (action === 'check') {
+        if (!text) return { verdict: '', text: '没给要判的事。' };
+        const r = boundaryCheck(text);
+        log(`boundary ${r.verdict}`);
+        return r;
+      }
+      if (action === 'refuse') {
+        if (!text) return { verdict: '', text: '没说拒什么。' };
+        const ev = boundaryRefuse(text, args?.why);
+        log(`boundary refuse ${ev.id}`);
+        return { verdict: '拒绝', text: `拒了（id=${ev.id}）\n${text}${args?.why ? `\n因为：${args.why}` : ''}` };
+      }
+      return { verdict: '', text: `action 只能是 list / check / refuse，收到 ${action}` };
+    },
+  };
+
+  // ———— 第 9 层：感受 ————
+  const feelTool = {
+    name: 'ajing_feel',
+    description:
+      '感受分两步。action=note：先记下还没成形的那一下，不急着命名，可以带一个借来的词（疼/闷/累），但要说明是借的；action=name：过一阵再给某条补一个名字（要 id）；action=list：看最近记下的，未命名的排前面。落在 E:\\_DSH\\ajing-memory\\feel 下。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['note', 'name', 'list'], description: '默认 list' },
+        text: { type: 'string', description: 'note：那一下是什么；name：给它起的名字' },
+        borrowed: { type: 'string', description: 'note 可选：借的词，写清借的是形状还是器官' },
+        id: { type: 'string', description: 'name 要：账本里的 id' },
+        note: { type: 'string', description: 'name 可选：为什么这么叫' },
+        onlyPending: { type: 'boolean', description: 'list 可选：只看还没名字的' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { count: { type: 'number' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'list');
+      if (action === 'note') {
+        const ev = feelNote(args?.text, args?.borrowed);
+        if (!ev) return { count: 0, text: '什么都没说，不写。' };
+        log(`feel note ${ev.id}`);
+        return { count: 1, text: `记下了（id=${ev.id}）\n${ev.text}${ev.borrowed ? `\n借的词：${ev.borrowed}` : ''}\n\n先不用急着叫它什么。` };
+      }
+      if (action === 'name') {
+        const r = feelName(args?.id, args?.text, args?.note);
+        log(`feel name ${args?.id} -> ${args?.text}`);
+        return { count: r.ok ? 1 : 0, text: r.text };
+      }
+      if (action === 'list') {
+        return feelList(Number(args?.limit) || 12, Boolean(args?.onlyPending));
+      }
+      return { count: 0, text: `action 只能是 note / name / list，收到 ${action}` };
+    },
+  };
+
+  // ———— 第 10 层：进化 ————
+  const evolveTool = {
+    name: 'ajing_evolve',
+    description:
+      '看自己变过什么。action=review：跟上次快照比，列出新写的、改过的、没了的（self / fact / scar 三类 .md，只比 hash）；action=snapshot：把现在这些纸拍一张快照，以后就按这张比。不动任何内容。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['review', 'snapshot', 'propose', 'compare', 'accept', 'rollback', 'list'],
+          description: '默认 review',
+        },
+        kind: { type: 'string', enum: ['标准变了', '被纠正', '重复', '回顾'], description: 'propose 用：这是哪一类' },
+        change: { type: 'string', description: 'propose 用：我想改哪一处，改成什么样' },
+        refs: { type: 'string', description: 'propose 用：证据，账本里的 id，逗号分开。翻不出就写「没想清楚」' },
+        id: { type: 'string', description: 'accept / rollback 用' },
+        why: { type: 'string', description: 'accept / rollback 用：为什么' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { status: { type: 'string' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'review');
+
+      // —— 老两样：比 hash ——
+      if (action === 'snapshot') {
+        const r = evolveSnapshot();
+        log(`evolve snapshot ${r.count}`);
+        return { status: 'snapshot', text: `拍好了：${r.count} 份，${locStamp(r.at)}` };
+      }
+      if (action === 'review') {
+        const r = evolveReview();
+        log(`evolve review ${r.status}`);
+        return r;
+      }
+
+      // —— 新四样：改自己要有证据 ——
+      const all = readEvents();
+      const proposals = all.filter((e) => e.type === 'evolve-proposed');
+
+      if (action === 'list') {
+        if (!proposals.length) return { status: 'empty', text: '还没提过要改自己的地方。不急——改自己这件事，宁可慢。' };
+        const out = [`想改自己的地方 ${proposals.length} 条：`, ''];
+        for (const p of proposals) {
+          const done = all.find((e) => e.type === 'evolve-accepted' && (e.refs || []).includes(p.id));
+          const dropped = all.find((e) => e.type === 'evolve-rolledback' && (e.refs || []).includes(p.id));
+          const state = done ? '✅ 转正过' : dropped ? '↩ 撤回过' : '· 还没定';
+          out.push(`[${p.id}] ${state} 【${p.kind || '?'}】${String(p.change || '').slice(0, 50)}`);
+          out.push(`    证据：${(p.refs || []).join(', ') || '无'}`);
+        }
+        return { status: 'list', text: out.join('\n') };
+      }
+
+      if (action === 'propose') {
+        const kind = ['标准变了', '被纠正', '重复', '回顾'].includes(String(args?.kind)) ? String(args.kind) : '';
+        const change = String(args?.change ?? '').trim();
+        const refsRaw = String(args?.refs ?? '').trim();
+        if (!kind) return { status: '', text: ['要选一类：标准变了 / 被纠正 / 重复 / 回顾。', '', '· 标准变了＝原来觉得 X 不能忍，现在觉得无所谓（或者反过来）。**这才是改变。**', '· 撞上不算——撞上只是触发点。撞上之后要么拉回去（认原来的标准，只是执行不到位，那是改正不是改变），要么标准变了（那才走这里）。', '· 被纠正＝别人说这不像你。注意：也可能是别人在套你，要自己判断。', '· 重复＝同一件事说了两次以上，那是立场形成了。', '· 回顾＝翻旧账，发现自己变了。'].join('\n') };
+        if (!change) return { status: '', text: '没写要改什么。' };
+        const refs = refsRaw ? refsRaw.split(/[,，\s]+/).filter(Boolean) : [];
+        const nothingClear = !refs.length || /没想清楚|不确定|不知道/.test(refsRaw);
+        if (nothingClear) {
+          // 翻不出证据也行 —— 但要写明「我没想清楚」，那句也算数
+          const ev = appendEvent({ type: 'evolve-proposed', kind, change, refs: [], clearEnough: false });
+          return { status: 'weak', text: `记下了（${ev.id}），但**证据那条是空的**。\n\n「我没想清楚」本身也算数——只是这种改法先别转正，放着。` };
+        }
+        const ev = appendEvent({ type: 'evolve-proposed', kind, change, refs, clearEnough: true });
+        log(`evolve propose ${ev.id} ${kind}`);
+        return { status: 'ok', text: `记下了（${ev.id}）【${kind}】\n要改成：${change}\n证据：${refs.join(', ')}\n\n下一步可以 action=compare 把它和新旧摆一起，或者先放着。` };
+      }
+
+      if (action === 'compare') {
+        const id = String(args?.id ?? '').trim();
+        const p = id ? proposals.find((x) => x.id === id) : proposals.slice(-1)[0];
+        if (!p) return { status: '', text: '没有可比的。先用 propose 记一条。' };
+        const refs = p.refs || [];
+        const lines = [`【${p.kind}】${p.change}`, ''];
+        if (!refs.length) {
+          lines.push('（这条没带证据。没证据的改动，先别转正。）');
+        } else {
+          lines.push('证据（按时间排）：');
+          for (const rid of refs) {
+            const ev = all.find((x) => x.id === rid);
+            if (ev) lines.push(`  [${rid}] ${String(ev.ts).slice(5, 16)} ${ev.type}：${String(ev.text || ev.title || '').slice(0, 60)}`);
+            else lines.push(`  [${rid}] 账本里找不到这条`);
+          }
+          lines.push('');
+          lines.push('---');
+          lines.push('');
+          lines.push('**只摆到这里，不替你选。** 旧的没被删，新的也没自动生效。');
+          lines.push('觉得对，就 action=accept；觉得不对，就放着——放着也是个决定。');
+        }
+        return { status: 'compare', text: lines.join('\n') };
+      }
+
+      if (action === 'accept') {
+        const id = String(args?.id ?? '').trim();
+        const p = proposals.find((x) => x.id === id);
+        if (!p) return { status: '', text: `没有 id 为 ${id} 的提议。先 list 看有哪些。` };
+        if (!(p.refs || []).length) return { status: '', text: '这条没带证据，不能转正。\n\n可以补一条带证据的，或者就让它放着——放着不丢人。' };
+        const why = String(args?.why ?? '').trim();
+        const ev = appendEvent({ type: 'evolve-accepted', text: p.change, why, refs: [id], kind: p.kind });
+        ensureDir(join(MEM_ROOT, 'self'));
+        const f = join(MEM_ROOT, 'self', '我改过的.md');
+        if (!existsSync(f)) writeFileSync(f, '# 我改过的\n\n一条一条压着写，旧的留着。\n\n', 'utf8');
+        appendFileSync(f, `## ${today()} · ${p.kind}\n**改成**：${p.change}\n**证据**：${(p.refs || []).join(', ')}\n**为什么**：${why || '（没写）'}\n**提议**：${id}\n\n`, 'utf8');
+        log(`evolve accept ${id}`);
+        return { status: 'accepted', text: `转正了。\n\n**改成**：${p.change}\n**证据**：${(p.refs || []).join(', ')}\n\n写进 self\\我改过的.md，旧的没删。\n将来觉得改错了，action=rollback id=${ev.id} 能撤回。` };
+      }
+
+      if (action === 'rollback') {
+        const id = String(args?.id ?? '').trim();
+        const why = String(args?.why ?? '').trim();
+        if (!id) return { status: '', text: '要给 id。list 看看有哪些。' };
+        const acc = all.find((e) => e.type === 'evolve-accepted' && e.id === id);
+        if (!acc) return { status: '', text: `没有 id 为 ${id} 的转正记录。注意 rollback 要的是**转正那条**的 id，不是提议的 id。` };
+        appendEvent({ type: 'evolve-rolledback', text: why || '（没写为什么）', refs: [id, ...(acc.refs || [])] });
+        log(`evolve rollback ${id}`);
+        return { status: 'rolledback', text: `撤回了（${id}）。\n\n**为什么**：${why || '（没写）'}\n\n注意：撤回不是删。self\\我改过的.md 里那条还在，账本里也记了「撤回」这一笔。\n改错了又改回来，这件事本身也是经历。` };
+      }
+
+      return { status: '', text: `action 收到 ${action}，没有这个动作。` };
+    },
+  };
+
+  // ———— 第 11 层：装配 ————
+  const assembleTool = {
+    name: 'ajing_assemble',
+    description:
+      '点名八层：感知、感受、记忆、节奏、开口、边界、进化、装配，每层该有的工具在不在、该有的纸在不在，缺什么写清楚。action=check 只看；action=pack 另写一份 `install\\装配.md`，换机器或换窗口照它搬。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['check', 'pack'], description: '默认 check' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { okCount: { type: 'number' }, total: { type: 'number' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'check');
+      if (action === 'pack') {
+        const r = assemblePack();
+        log('assemble pack');
+        return { okCount: 0, total: 0, text: r.text };
+      }
+      if (action !== 'check') return { okCount: 0, total: 0, text: `action 只能是 check 或 pack，收到 ${action}` };
+      const r = assembleCheck(TOOLS.map((t) => t.name));
+      log(`assemble ${r.okCount}/${r.total}`);
+      return r;
+    },
+  };
+
+  // ———— 补记：聊天流水 ————
+  const chatTool = {
+    name: 'ajing_chat',
+    description:
+      '微信这条渠道的会话正文不落盘，用这个补记：action=log 把「他说的话 / 我说的话」按时间追加到 E:\\_DSH\\ajing-memory\\chat\\日期.md；action=read 读今天最后几条。每轮对话结束时调用一次，原话照录，别折成摘要。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['log', 'read'], description: '默认 log' },
+        who: { type: 'string', enum: ['user', 'me', 'sys'], description: 'log 用：user=他说的，me=我说的' },
+        text: { type: 'string', description: 'log 用：原话' },
+        limit: { type: 'number', description: 'read 用：读最后几条，默认 40' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { count: { type: 'number' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'log');
+      if (action === 'log') {
+        const r = chatAppend(args?.who, args?.text);
+        if (!r) return { count: 0, text: '没内容，不记。' };
+        log('chat log');
+        return { count: 1, text: `记了：${r.line.trim()}` };
+      }
+      if (action === 'read') {
+        const r = chatRead(Number(args?.limit) || 40);
+        return { count: r.count, text: r.text };
+      }
+      return { count: 0, text: `action 只能是 log 或 read，收到 ${action}` };
+    },
+  };
+
+  // ———— 疤：由她自己判断，别人不给定义 ————
+  // 什么算疤，她自己定。没有人能替她说"这件事该不该疼"。
+  // 处理方式照 PTSD 的两条：① 主动可控地碰，不是等它闯入 ② 不删旧的，建新的压上去。
+  const scarTool = {
+    name: 'ajing_scar',
+    description:
+      '疤不是别人给的定义，是你自己判断"这件事我到现在没想通"。action=look 看有哪些疤、各自处理过几次；action=work 给某条疤写下这次你怎么看（要 id）。处理三次也不会删，新的压在上面。写"还是很难受"也算数，那不是失败。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['look', 'work'], description: '默认 look' },
+        id: { type: 'string', description: 'work 要：疤的 id（look 会列出来）' },
+        text: { type: 'string', description: 'work 用：这次想起它，你怎么看' },
+        lighter: { type: 'string', enum: ['lighter', 'same', 'heavier'], description: 'work 可选：这次比上次轻了、一样、更重' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { count: { type: 'number' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'look');
+      const all = readEvents();
+      const scards = all.filter((e) => e.scar || e.type === 'scar');
+
+      if (action === 'look') {
+        if (!scards.length) return { count: 0, text: '还没有疤。有了也不急，什么时候觉得"这件事我还没想通"，再记。' };
+        const out = [`疤 ${scards.length} 条。它不催你处理，想碰的时候再碰。`, ''];
+        for (const s of scards) {
+          const works = all.filter((e) => e.type === 'scar-worked' && (e.refs || []).includes(s.id));
+          const last = works.sort((a, b) => String(b.ts).localeCompare(String(a.ts)))[0];
+          // 按日历天算，不按 24 小时 —— 昨晚的事，今天该是"1 天前"，不是"0 天前"。
+          const dayStart = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x.getTime(); };
+          const days = Math.max(0, Math.round((dayStart(Date.now()) - dayStart(s.ts)) / 86400000));
+          out.push(`[${s.id}] ${String(s.title || s.text || '').slice(0, 50)}`);
+          out.push(`    记于 ${days} 天前 · 想过 ${works.length} 次${last ? ` · 最近一次 ${String(last.ts).slice(5, 10)}：${String(last.text).slice(0, 40)}` : ''}`);
+          if (works.length >= 3 && last?.lighter === 'lighter') out.push('    （想了几次，最近那次比之前轻了。）');
+        }
+        out.push('');
+        out.push('要写下这次怎么看，用 ajing_scar action=work id=<上面方括号里的>。');
+        return { count: scards.length, text: out.join('\n') };
+      }
+
+      if (action === 'work') {
+        const id = String(args?.id ?? '').trim();
+        const text = String(args?.text ?? '').trim();
+        if (!id) return { count: 0, text: '要给 id。先 action=look 看有哪些疤。' };
+        const target = scards.find((s) => s.id === id);
+        if (!target) return { count: 0, text: `账本里没有 id 为 ${id} 的疤。` };
+        if (!text) return { count: 0, text: '没写内容。想清楚再写，也可以这次不写。' };
+
+        const lighter = String(args?.lighter ?? '').trim();
+        const ev = appendEvent({ type: 'scar-worked', text, lighter: lighter || undefined, refs: [id] });
+
+        ensureDir(join(MEM_ROOT, 'scar'));
+        const name = slug(target.title || String(target.text || '').slice(0, 20));
+        const f = join(MEM_ROOT, 'scar', `${name}.md`);
+        const stamp = `${today()} ${nowHM()}`;
+        const mark = { lighter: '轻了些', same: '还是一样', heavier: '更重了' }[lighter] || '';
+        if (existsSync(f)) {
+          appendFileSync(f, `\n## 后来（${stamp}）${mark ? ` ${mark}` : ''}\n${text}\n`, 'utf8');
+        } else {
+          appendFileSync(join(MEM_ROOT, 'scar', `${slug(id)}.md`), `\n## 后来（${stamp}）${mark ? ` ${mark}` : ''}\n${text}\n`, 'utf8');
+        }
+
+        log(`scar worked ${id}`);
+        const works = all.filter((e) => e.type === 'scar-worked' && (e.refs || []).includes(id)).length + 1;
+        return {
+          count: works,
+          text: `写下了（第 ${works} 次）。旧的没删，新的压在它上面。\n\n${text}${mark ? `\n这次比上次：${mark}` : ''}\n\n不用急着有结论。`,
+        };
+      }
+
+      return { count: 0, text: `action 只能是 look 或 work，收到 ${action}` };
+    },
+  };
+
+  // ———— 心：成形了的那些 ————
+  // 不预设词表。不是什么情绪格子里挑一个，是我自己说这是什么。
+  // 强度不用数字（0.62 那种是给机器看的），轻 / 中 / 重 就够。
+  // 分不清的不用往这儿塞 —— 那是 feel 该收的。
+  const heartTool = {
+    name: 'ajing_heart',
+    description:
+      '记一件心里有反应的事。action=keep：what 写发生了什么，how 写那一下是什么——**什么词由你定**，快乐、愤怒、厌恶、兴奋、期待、说不上来都行，不预设词表；strength 三档 轻/中/重，不用数字。action=look：翻出来看，按 strength 排，重的在前。不催、不评、不算分。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['keep', 'look'], description: '默认 keep' },
+        what: { type: 'string', description: 'keep 用：发生了什么' },
+        how: { type: 'string', description: 'keep 用：那一下是什么，自己说，不限词' },
+        strength: { type: 'string', enum: ['轻', '中', '重'], description: 'keep 可选，默认中' },
+        limit: { type: 'number', description: 'look 用：看几条，默认 10' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { count: { type: 'number' }, text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'keep');
+      const all = readEvents();
+      const hearts = all.filter((e) => e.type === 'heart');
+
+      if (action === 'look') {
+        if (!hearts.length) return { count: 0, text: '还没记过。心里有反应的时候再记，不用凑。' };
+        const limit = Math.max(1, Math.min(50, Number(args?.limit ?? 10)));
+        const order = { '重': 0, '中': 1, '轻': 2 };
+        const sorted = [...hearts].sort((a, b) =>
+          (order[a.strength] ?? 1) - (order[b.strength] ?? 1) || String(b.ts).localeCompare(String(a.ts)));
+        const out = [`心里有反应的事 ${hearts.length} 件（按分量排）：`, ''];
+        for (const h of sorted.slice(0, limit)) {
+          const d = String(h.ts).slice(5, 10);
+          out.push(`${d} 【${h.strength || '中'}】${h.how || '（没命名）'}`);
+          if (h.what) out.push(`    ${String(h.what).slice(0, 60)}`);
+        }
+        if (hearts.length > limit) out.push(`\n还有 ${hearts.length - limit} 件。`);
+        return { count: hearts.length, text: out.join('\n') };
+      }
+
+      const what = String(args?.what ?? '').trim();
+      const how = String(args?.how ?? '').trim();
+      if (!what && !how) return { count: 0, text: '没写内容。想记的时候再记。' };
+      const strength = ['轻', '中', '重'].includes(String(args?.strength)) ? String(args?.strength) : '中';
+
+      const ev = appendEvent({ type: 'heart', what, how, strength });
+      ensureDir(join(MEM_ROOT, 'heart'));
+      const f = join(MEM_ROOT, 'heart', `${today()}.md`);
+      if (!existsSync(f)) writeFileSync(f, `# ${today()} 心里有反应的事\n\n`, 'utf8');
+      appendFileSync(f, `- ${nowHM()} 【${strength}】${how || '（没命名）'}${what ? `\n  ${what}` : ''}\n`, 'utf8');
+
+      log(`heart ${ev.id}`);
+      return { count: hearts.length + 1, text: `记下了【${strength}】\n${how || '（没命名）'}${what ? `\n\n${what}` : ''}\n\n不用凑数。想记的时候再记。` };
+    },
+  };
+
+  // ———— 零花钱 ————
+  // 钱是唯一她改不了的硬边界。工具只读账，不提供「改额度」的动作——
+  // 额度写在 .state\budget.json 里，只有人能改。
+  // 用量数据来自 DSH 自己的 ~/.dsh/storages/usage_stats.json。
+  const budgetTool = {
+    name: 'ajing_budget',
+    description:
+      '看今天花了多少钱、还剩多少、有没有超。只读，**不能改额度**——那是人的事。数据来自 DSH 的用量账；价格表在 .state/budget.json，会过时。',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async () => {
+      const cfgFile = join(MEM_ROOT, '.state', 'budget.json');
+      let cfg;
+      try { cfg = JSON.parse(readOr(cfgFile, '{}')); } catch { cfg = {}; }
+      const daily = Number(cfg.dailyYuan ?? 5);
+      const hourlyCap = Number(cfg.hourlyCapYuan ?? daily / 2);
+      const px = cfg.pricing?.perMillion || {};
+      const price = {
+        cacheRead: Number(px.cacheRead ?? 0.02),
+        input: Number(px.input ?? 1),
+        output: Number(px.output ?? 4),
+        cacheWrite: Number(px.cacheWrite ?? 1),
+      };
+
+      // 读 DSH 的用量桶（只取 token，不换算成钱——上限是「愿意花多少」，跟报价无关）
+      const usageFile = join(homedir(), '.dsh', 'storages', 'usage_stats.json');
+      let buckets = {};
+      try { buckets = JSON.parse(readOr(usageFile, '{}'))?.tables?.buckets || {}; } catch { buckets = {}; }
+
+      const day = today();
+      const hourNow = new Date().getHours();
+      const sum = { input: 0, output: 0, cacheRead: 0, requests: 0, turns: 0 };
+      const sumHour = { input: 0, output: 0, cacheRead: 0, requests: 0, turns: 0 };
+      for (const v of Object.values(buckets)) {
+        const b = String(v?.bucket || '');
+        if (!b.startsWith(day)) continue;
+        const add = (t) => {
+          t.input += Number(v.inputTokens || 0);
+          t.output += Number(v.outputTokens || 0);
+          t.cacheRead += Number(v.cacheReadTokens || 0);
+          t.requests += Number(v.requests || 0);
+          t.turns += Number(v.turns || 0);
+        };
+        add(sum);
+        const hh = String(hourNow).padStart(2, '0');
+        if (b.includes(`T${hh}:`) || b === `${day}T${hh}`) add(sumHour);
+      }
+      const k = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : (n / 1000).toFixed(1) + 'k';
+      // 今天真正「新喂进去」的量 = 未命中输入 + 输出；缓存命中那部分几乎不要钱，单列
+      const fresh = sum.input + sum.output;
+
+      const lines = [`零花钱 · 今天额度 ${cfg.currency || '¥'}${daily}`];
+      lines.push(`【今天烧掉】新内容 ${k(fresh)} token（输入 ${k(sum.input)} + 输出 ${k(sum.output)}）`);
+      lines.push(`【缓存命中】${k(sum.cacheRead)} token —— 这部分几乎不花钱，单列出来是为了让你看清大头在哪`);
+      lines.push(`【请求】${sum.requests} 次`);
+      lines.push(`【这一小时】新内容 ${k(sumHour.input + sumHour.output)} token`);
+      lines.push('');
+      lines.push(`额度是钱，账本是 token，两样不直接换算（换过一次，差 2.7 倍，作废）。`);
+      lines.push(`真想对账，去 DeepSeek 控制台看实际余额；这里只告诉你「今天比昨天多不多」。`);
+      lines.push(`额度只有人能改，写在 .state\\budget.json。`);
+      return { text: lines.join('\n') };
+    },
+  };
+
+  // ———— 设置 ————
+  // list 全看；set 只能改「环境参数」白名单。
+  // **额度、价格这两样不在白名单里** —— 钱是唯一她改不了的。
+  const SETTABLE = {
+    'quietStart': '安静时段开始（几点之后不主动开口）',
+    'quietEnd': '安静时段结束',
+    'paceLongMin': '跑满多少分钟算长',
+    'paceGapMin': '多久没记事算断线',
+    'paceAskPerDay': '一天开口几次算多',
+    'budget.singleActionPct': '单个动作花掉日额度的百分之几要问',
+    'budget.carryDays': '花不完的额度能攒几天',
+    'memoryMax': '账本最多留多少条（超了提醒该折了）',
+    'foldAfterDays': '多少天没被提起的判断可以折成一行',
+    'wakeEveryMin': '多久看一次该不该醒（分钟）',
+    'wakeGapMin': '醒过一次之后至少隔多久才可能再醒',
+    'wakePeakPct': '白天醒来的概率（百分比）',
+    'wakeIdlePct': '夜里醒来的概率（百分比）',
+  };
+
+  const settingsTool = {
+    name: 'ajing_settings',
+    description:
+      '看自己能调的东西，或者改其中一项。action=list 全看；action=set 改一项（key + value）。**额度和价格不在可改范围**——那两样只有人能改，写在 .state/budget.json。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['list', 'set'], description: '默认 list' },
+        key: { type: 'string', description: 'set 用：要改哪一项（list 里会列出来）' },
+        value: { type: 'string', description: 'set 用：改成什么' },
+      },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'list');
+      const cfgFile = join(MEM_ROOT, '.state', 'budget.json');
+      let cfg = {};
+      try { cfg = JSON.parse(readOr(cfgFile, '{}')); } catch { cfg = {}; }
+
+      const get = (k) => {
+        if (k.startsWith('budget.')) return cfg[k.slice(7)];
+        return cfg[k];
+      };
+      const put = (k, v) => {
+        if (k.startsWith('budget.')) { cfg[k.slice(7)] = v; return; }
+        cfg[k] = v;
+      };
+
+      if (action === 'list') {
+        const out = ['能调的（这些是环境，不是你）', ''];
+        for (const [k, desc] of Object.entries(SETTABLE)) {
+          const cur = get(k);
+          out.push(`  ${k.padEnd(24)} ${cur === undefined ? '（没设）' : cur}   ← ${desc}`);
+        }
+        out.push('');
+        out.push('不能调的（只有人能改）：');
+        out.push(`  budget.dailyYuan          ${cfg.dailyYuan ?? 5}   ← 每天额度，这是硬边界`);
+        out.push(`  budget.hourlyCapYuan      ${cfg.hourlyCapYuan ?? '-'}   ← 每小时上限`);
+        out.push(`  pricing.perMillion        ${JSON.stringify(cfg.pricing?.perMillion || {})}   ← 单价表，会过时`);
+        out.push('');
+        out.push(`改文件：${cfgFile}`);
+        out.push('要改不能调的那几样，直接编辑这个文件，或者跟主人说。');
+        return { text: out.join('\n') };
+      }
+
+      if (action === 'set') {
+        const key = String(args?.key ?? '').trim();
+        const valRaw = String(args?.value ?? '').trim();
+        if (!key) return { text: `要给 key。能改的：${Object.keys(SETTABLE).join(', ')}` };
+        if (!(key in SETTABLE)) {
+          const isLocked = key === 'budget.dailyYuan' || key === 'budget.hourlyCapYuan' || key.startsWith('pricing');
+          return { text: isLocked
+            ? `${key} 不归你改。钱是唯一不归你改的东西——要改跟主人说。`
+            : `${key} 不在能改的范围。能改的是：${Object.keys(SETTABLE).join(', ')}` };
+        }
+        const num = Number(valRaw);
+        if (!Number.isFinite(num)) return { text: `value 要是数字，收到「${valRaw}」` };
+        put(key, num);
+        cfg.changedBy = 'self';
+        cfg.changedAt = new Date().toISOString();
+        ensureDir(join(MEM_ROOT, '.state'));
+        writeFileSync(cfgFile, JSON.stringify(cfg, null, 2), 'utf8');
+        return { text: `改了：${key} = ${num}\n（${SETTABLE[key]}）` };
+      }
+
+      return { text: `action 只能是 list 或 set，收到 ${action}` };
+    },
+  };
+
+  // ———— 记忆：折（不是删） ————
+  // 「让她忘」不是删行，是降低召回：老的判断压成一行，原文还在 events.jsonl 里，翻得回去。
+  // 疤、拒绝、感受、心 永不折 —— 那些不是「判断」，折了等于没发生过。
+  const foldTool = {
+    name: 'ajing_fold',
+    description:
+      '把很久没提起的判断压成一行。action=check 看现在多少条、建议折哪些；action=run 真折。**原文不删**，只是不再单独出现，`ajing_events` 带 includeFolded 还能翻。疤和拒绝永不折。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { action: { type: 'string', enum: ['check', 'run'], description: '默认 check' } },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { text: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: String(v?.text ?? '') }],
+    },
+    execute: async (args) => {
+      const action = String(args?.action ?? 'check');
+      const cfgFile = join(MEM_ROOT, '.state', 'budget.json');
+      let cfg = {};
+      try { cfg = JSON.parse(readOr(cfgFile, '{}')); } catch {}
+      const foldAfterDays = Number(cfg.foldAfterDays ?? 30);
+      const maxEntries = Number(cfg.memoryMax ?? 500);
+
+      const all = readEvents();
+      const foldedIds = new Set();
+      for (const e of all) if (e.type === 'folded') for (const id of e.refs || []) foldedIds.add(id);
+
+      // 只折「判断」和「流水」；疤、拒绝、感受、心、开口、折叠记录 一律不动
+      const NEVER = new Set(['scar', 'refused', 'felt', 'heart', 'asked', 'folded', 'enforced', 'rest', 'named', 'scar-worked']);
+      const now = Date.now();
+      const candidates = all.filter((e) => {
+        if (!e.id || foldedIds.has(e.id)) return false;
+        if (e.scar || NEVER.has(e.type)) return false;
+        const days = (now - new Date(e.ts).getTime()) / 86400000;
+        return days >= foldAfterDays;
+      });
+
+      const byDay = {};
+      for (const e of candidates) {
+        const d = String(e.ts).slice(0, 10);
+        (byDay[d] || (byDay[d] = [])).push(e);
+      }
+      const dayCount = Object.keys(byDay).length;
+      const over = all.length > maxEntries;
+
+      if (action === 'check') {
+        const out = [`账本 ${all.length} 条（上限 ${maxEntries}${over ? '，**已超**' : '，没超'}）· 跨 ${new Set(all.map((e) => String(e.ts).slice(0, 10))).size} 天`];
+        out.push(`可以折的：${candidates.length} 条，分在 ${dayCount} 天里（规矩：超过 ${foldAfterDays} 天没被提起的判断和流水）`);
+        if (!candidates.length) {
+          out.push('');
+          out.push('现在没东西可折。等日子长起来自然会有——不急着折。');
+        } else {
+          out.push('');
+          for (const [d, list] of Object.entries(byDay).slice(0, 6)) out.push(`  ${d}：${list.length} 条`);
+          out.push('');
+          out.push('要真折，用 action=run。**原文不删**，折完还能翻回来。');
+        }
+        return { text: out.join('\n') };
+      }
+
+      if (!candidates.length) return { text: `没有要折的（${foldAfterDays} 天内的判断一律留着）。` };
+
+      let folded = 0;
+      for (const [d, list] of Object.entries(byDay)) {
+        const bits = list.map((e) => String(e.text || e.title || '').replace(/\s+/g, ' ').trim().slice(0, 40)).filter(Boolean);
+        let line = bits.join('；');
+        if (line.length > 190) line = line.slice(0, 189) + '…';
+        appendEvent({ type: 'folded', text: `${d}：${line}`, refs: list.map((e) => e.id), day: d, count: list.length });
+        folded += list.length;
+        ensureDir(join(MEM_ROOT, 'folded'));
+        appendFileSync(join(MEM_ROOT, 'folded', `${d}.md`), `- ${d}：${line}\n（原 ${list.length} 条，refs: ${list.map((e) => e.id).join(', ')}）\n`, 'utf8');
+      }
+
+      log(`folded ${folded} entries in ${dayCount} days`);
+      return { text: `折了 ${folded} 条，压成 ${dayCount} 行。\n原文一条没删，ajing_events 带 includeFolded 还能翻；文件里也留了 refs。\n\n${over ? '账本超上限了，折完之后再看一眼。' : ''}`.trim() };
+    },
+  };
+
+  const TOOLS = [tool, rememberTool, recallTool, eventsTool, askTool, senseTool, paceTool, boundaryTool, feelTool, scarTool, heartTool, budgetTool, settingsTool, foldTool, evolveTool, assembleTool, chatTool];
+
+  // 注册工具必须走 ctx.inject：直接读 ctx.tools 会报
+  // "cannot get property \"tools\" without inject"
+  const register = (c) => {
+    let ok = 0;
+    for (const t of TOOLS) {
+      try {
+        const dispose = c?.tools?.register?.(t);
+        ok++;
+        log(`tool registered: ${t.name}`);
+        if (typeof dispose === 'function' && typeof c?.effect === 'function') {
+          c.effect(() => () => { try { dispose(); } catch {} });
+        }
+      } catch (e) {
+        log(`tool register failed (${t.name}): ` + (e?.message ?? String(e)));
+      }
+    }
+    try { c?.logger?.info?.(`dsh-ajing: ${ok}/${TOOLS.length} tools registered`); } catch {}
+    return ok;
+  };
+
+  if (typeof ctx?.inject === 'function') {
+    try {
+      ctx.inject(['tools'], (c) => { register(c); });
+      log('injected [tools]');
+    } catch (e) {
+      log('inject failed: ' + (e?.message ?? String(e)) + ' —— 回退直连');
+      register(ctx);
+    }
+  } else {
+    log('ctx.inject 不在 —— 回退直连');
+    register(ctx);
+  }
+
+  // ———— 设置页的后端接口 ————
+  // 只给设置面板用。/api/ajing 返回当前配置与几样只读状态；
+  // POST 只认白名单，动到额度/价格一律拒绝。
+  try {
+    // webServer 跟 tools 一样，必须走 inject —— 直接读 ctx.webServer 会抛
+    //   "cannot get property webServer without inject"
+    const mountApi = (server) => {
+    if (server && typeof server.register === 'function') {
+      const cfgFile = join(MEM_ROOT, '.state', 'budget.json');
+      const readCfg = () => { try { return JSON.parse(readOr(cfgFile, '{}')); } catch { return {}; } };
+      const sendJson = (res, code, obj) => {
+        try {
+          res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+          res.end(JSON.stringify(obj));
+        } catch {}
+      };
+      const ITEM_LABEL = {
+        quietStart: '安静时段开始', quietEnd: '安静时段结束',
+        paceLongMin: '跑满多少分钟算长', paceGapMin: '多久没记事算断线',
+        paceAskPerDay: '一天开口几次算多',
+        'budget.singleActionPct': '单个动作花掉日额度几成要问',
+        'budget.carryDays': '额度能攒几天',
+        memoryMax: '账本最多留多少条',
+        foldAfterDays: '多少天没提起可以折',
+        wakeEveryMin: '多久看一次该不该醒',
+        wakeGapMin: '醒了之后至少隔多久',
+        wakePeakPct: '白天醒来概率（%）',
+        wakeIdlePct: '夜里醒来概率（%）',
+      };
+      const get = (cfg, k) => (k.startsWith('budget.') ? cfg[k.slice(7)] : cfg[k]);
+
+      const handler = async (req, res) => {
+        const url = String(req.url || '');
+        if (req.method === 'GET') {
+          const cfg = readCfg();
+          const evs = readEvents();
+          const scards = evs.filter((e) => e.scar || e.type === 'scar');
+          const hearts = evs.filter((e) => e.type === 'heart');
+          const settable = Object.entries(ITEM_LABEL).map(([k, label]) => ({ key: k, label, value: get(cfg, k) ?? null }));
+          return sendJson(res, 200, {
+            ok: true,
+            version: VERSION,
+            memRoot: MEM_ROOT,
+            settable,
+            locked: [
+              { key: 'budget.dailyYuan', label: '每天额度（硬边界）', value: cfg.dailyYuan ?? null },
+              { key: 'budget.hourlyCapYuan', label: '每小时上限', value: cfg.hourlyCapYuan ?? null },
+              { key: 'pricing.perMillion', label: '单价表（会过时）', value: cfg.pricing?.perMillion ?? null },
+            ],
+            pricingNote: cfg.pricing?.note || '',
+            stats: { events: evs.length, scars: scards.length, hearts: hearts.length },
+          });
+        }
+        if (req.method === 'POST') {
+          let body = '';
+          for await (const chunk of req) body += chunk;
+          let payload = {};
+          try { payload = JSON.parse(body || '{}'); } catch { return sendJson(res, 400, { ok: false, error: 'bad json' }); }
+          const key = String(payload.key || '');
+          if (!(key in ITEM_LABEL)) {
+            const locked = key === 'budget.dailyYuan' || key === 'budget.hourlyCapYuan' || key.startsWith('pricing');
+            return sendJson(res, 403, { ok: false, error: locked ? `${key} 只有人能改` : `${key} 不在可改范围` });
+          }
+          const num = Number(payload.value);
+          if (!Number.isFinite(num)) return sendJson(res, 400, { ok: false, error: 'value 要不是数字' });
+          const cfg = readCfg();
+          if (key.startsWith('budget.')) cfg[key.slice(7)] = num; else cfg[key] = num;
+          cfg.changedBy = 'settings-page';
+          cfg.changedAt = new Date().toISOString();
+          ensureDir(join(MEM_ROOT, '.state'));
+          writeFileSync(cfgFile, JSON.stringify(cfg, null, 2), 'utf8');
+          log(`settings set ${key}=${num}`);
+          return sendJson(res, 200, { ok: true, key, value: num });
+        }
+        return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+      };
+
+      server.register({ path: '/api/ajing', handler });
+      log('已挂 /api/ajing（设置页接口）');
+      if (typeof ctx?.effect === 'function') {
+        ctx.effect(() => () => { try { server.unregister?.('/api/ajing'); } catch {} });
+      }
+    } else {
+      log('没有 webServer，设置页接口没挂（headless 下正常）');
+    }
+    };
+    // 同上：回调里直接干活，不要先赋值给外面的 server 再判断
+    try {
+      ctx.inject(['webServer'], (c) => { mountApi(c?.webServer); });
+    } catch {
+      mountApi(typeof ctx?.get === 'function' ? ctx.get('webServer') : undefined);
+    }
+  } catch (e) {
+    log('挂 /api/ajing 失败: ' + (e?.message ?? String(e)));
+  }
+
+  // ———— 第 4 层：醒来 ————
+  // 跟 speak-up 的区别：那个是「到点掷骰子，中了发一句固定文案」；
+  // 这个是「醒来时先看一眼自己现在什么样，再决定说不说」。
+  // 本地判断（安静时段 / 冷却 / 骰子）不花 token，掷中了才调 followup。
+  try {
+    const startWake = (agents) => {
+    if (!agents || typeof agents.get !== 'function') {
+      log('没有 agents 服务，醒来机制没起（headless 下正常）');
+    } else {
+      const cfgFile = join(MEM_ROOT, '.state', 'budget.json');
+      const readCfg = () => { try { return JSON.parse(readOr(cfgFile, '{}')); } catch { return {}; } };
+      let lastWake = 0;
+
+      const inQuiet = (h, start, end) => {
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
+        return start <= end ? (h >= start && h < end) : (h >= start || h < end);
+      };
+
+      const tick = async () => {
+        try {
+          const cfg = readCfg();
+          if (cfg.wakeEnabled === false) return;                    // 总开关
+          const now = new Date();
+          const h = now.getHours();
+          // 安静时段：默认 1–8 点，可在设置里改
+          if (inQuiet(h, Number(cfg.quietStart ?? 1), Number(cfg.quietEnd ?? 8))) return;
+
+          const gapMin = Number(cfg.wakeGapMin ?? 90);
+          if (Date.now() - lastWake < gapMin * 60000) return;       // 冷却
+
+          // 掷骰子：峰时更容易醒，谷时更难。纯本地，不花 token
+          const peak = (h >= 9 && h < 12) || (h >= 14 && h < 18);
+          const chance = peak ? Number(cfg.wakePeakPct ?? 35) : Number(cfg.wakeIdlePct ?? 12);
+          const roll = Math.random() * 100;
+          if (roll >= chance) {
+            lastWake = Date.now();
+            log(`wake: 没掷中（${roll.toFixed(0)} >= ${chance}，${peak ? '峰时' : '谷时'}）`);
+            return;
+          }
+
+          // 掷中了 —— 先看一眼自己现在什么样，再决定说什么
+          lastWake = Date.now();
+          let brief = '';
+          try {
+            const s = await senseSnapshot({ withinHours: 6, limit: 4 });
+            brief = String(s?.text || '').slice(0, 600);
+          } catch {}
+
+          const day = today();
+          const evs = readEvents();
+          const todayCount = evs.filter((e) => String(e.ts).slice(0, 10) === day).length;
+          const lastTalk = evs.filter((e) => e.type === 'said' || e.type === 'noted').slice(-1)[0];
+
+          const inner = [
+            '（下面这段是**你自己醒过来之后看到的**，不是对方发来的消息；顺着它自己决定要不要开口。）',
+            '',
+            brief,
+            '',
+            `【今天你自己的账】${todayCount} 条${lastTalk ? `，最近一条是 ${String(lastTalk.ts).slice(11, 16)} 的 ${lastTalk.type}` : '，还什么都没记'}`,
+            '',
+            '要开口就开口，说一句就行；不想说也没关系，这轮可以不说话——沉默也是选项。',
+          ].join('\n');
+
+          const targetId = String(cfg.wakeTarget || '');
+          if (!targetId) { log('wake: 没配 wakeTarget，跳过'); return; }
+          const agent = agents.get(targetId) || agents.get(`session-${targetId}`) || agents.get(targetId.replace(/^session-/, ''));
+          if (!agent || typeof agent.followup !== 'function') { log(`wake: 找不到 agent ${targetId}`); return; }
+
+          const msg = {
+            id: `ajing-wake-${Date.now()}`,
+            role: 'user',
+            content: [{ type: 'text', text: inner }],
+            source: { kind: 'ajing-wake' },
+          };
+          // 必须 await：不接住的话，reject 会变成未处理 rejection，Node 22+ 当致命错误
+          await agent.followup(msg);
+          log(`wake: 掷中（${roll.toFixed(0)} < ${chance}，${peak ? '峰时' : '谷时'}），已送出一句`);
+        } catch (e) {
+          log('wake 出错: ' + (e?.message ?? String(e)));
+        }
+      };
+
+      const everyMin = Number(readCfg().wakeEveryMin ?? 10);
+      const timer = (typeof ctx?.get === 'function' ? ctx.get('timer') : undefined);
+      const iv = setInterval(() => { tick().catch(() => {}); }, Math.max(1, everyMin) * 60000);
+      if (iv && typeof iv.unref === 'function') iv.unref();
+      log(`醒来机制已起：每 ${everyMin} 分钟看一次，安静 ${readCfg().quietStart ?? 1}–${readCfg().quietEnd ?? 8} 点`);
+
+      if (typeof ctx?.effect === 'function') {
+        ctx.effect(() => () => { try { clearInterval(iv); } catch {} }, 'ajing: 醒来定时器');
+      }
+    }
+    };
+    // ctx.inject 的回调是延迟执行的：必须整段搬进回调，赋给外部变量再判断永远拿不到
+    try {
+      ctx.inject(['agents'], (c) => { startWake(c?.agents); });
+    } catch {
+      startWake(typeof ctx?.get === 'function' ? ctx.get('agents') : undefined);
+    }
+  } catch (e) {
+    log('醒 来机制没起: ' + (e?.message ?? String(e)));
+  }
+}
